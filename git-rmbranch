@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: git rmbranch [-f|--force] [--] <branch>
+
+Remove a local branch's linked worktree, then delete the branch.
+By default, refuse unmerged branches and dirty worktrees.
+Ignored files do not block removal and are discarded with the worktree.
+--force allows deleting unmerged commits and discarding worktree changes,
+including untracked and ignored files. It also permits removing submodules.
+The main worktree, current worktree, and locked worktrees are never removed.
+No remote branches are deleted.
+EOF
+}
+
+die() {
+  printf 'git rmbranch: %s\n' "$*" >&2
+  exit 1
+}
+
+force=false
+while (($#)); do
+  case "$1" in
+    -f|--force) force=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) usage >&2; die "Unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+if (($# != 1)); then
+  usage >&2
+  exit 1
+fi
+branch=$1
+ref="refs/heads/$branch"
+git check-ref-format "$ref" || die "Invalid branch name: $branch"
+git show-ref --verify --quiet "$ref" || die "Local branch not found: $branch"
+
+current_worktree=
+if [[ $(git rev-parse --is-bare-repository) == false ]]; then
+  current_worktree=$(git rev-parse --show-toplevel)
+fi
+# Keep NUL-delimited paths intact while checking the listing command's status.
+listing=$(git worktree list --porcelain -z | base64)
+main_worktree=
+path=
+locked=false
+matches_ref=false
+worktrees=()
+while IFS= read -r -d '' field; do
+  case "$field" in
+    "worktree "*)
+      path=${field#worktree }
+      if [[ -z "$main_worktree" ]]; then
+        main_worktree=$path
+      fi
+      locked=false
+      matches_ref=false
+      ;;
+    "branch $ref") worktrees+=("$path"); matches_ref=true ;;
+    locked|locked\ *) locked=true ;;
+    "")
+      if [[ "$locked" == true && "$matches_ref" == true ]]; then
+        die "Worktree is locked: $path"
+      fi
+      ;;
+  esac
+done < <(printf '%s' "$listing" | base64 --decode)
+
+((${#worktrees[@]} <= 1)) || die "Branch is checked out in multiple worktrees; remove them individually."
+worktree=${worktrees[0]:-}
+if [[ -n "$worktree" ]]; then
+  [[ "$worktree" != "$main_worktree" ]] || die "Cannot remove the main worktree: $worktree"
+  [[ "$worktree" != "$current_worktree" ]] || die "Run this command from outside the target worktree: $worktree"
+fi
+
+if [[ "$force" == false ]]; then
+  merge_target=HEAD
+  upstream=$(git for-each-ref --format='%(upstream)' "$ref")
+  if [[ -n "$upstream" ]] && git rev-parse --verify --quiet "$upstream^{commit}" >/dev/null; then
+    merge_target=$upstream
+  fi
+  if git merge-base --is-ancestor "$ref" "$merge_target"; then
+    :
+  else
+    status=$?
+    [[ "$status" == 1 ]] || die "Could not check whether the branch is merged into $merge_target."
+    die "Branch is not fully merged into $merge_target; use --force to discard its commits."
+  fi
+  if [[ -n "$worktree" ]]; then
+    changes=$(git -C "$worktree" status --porcelain --untracked-files=all --ignore-submodules=none)
+    if [[ -n "$changes" ]]; then
+      printf -v status_command 'git -C %q status --short --untracked-files=all --ignore-submodules=none' "$worktree"
+      die "Worktree has modified or untracked files: $worktree
+View changes with:
+  $status_command"
+    fi
+  fi
+fi
+
+if [[ -n "$worktree" ]]; then
+  if [[ "$force" == true ]]; then
+    git worktree remove --force -- "$worktree"
+  else
+    git worktree remove -- "$worktree"
+  fi
+  printf 'Removed worktree: %s\n' "$worktree"
+fi
+if [[ "$force" == true ]]; then
+  git branch -D -- "$branch"
+else
+  git branch -d -- "$branch"
+fi
